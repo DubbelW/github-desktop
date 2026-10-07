@@ -42,23 +42,58 @@ Python 3 series.
 There are some additional dependencies which are required as part of building
 and running GitHub Desktop locally:
 
- - `libsecret-1.so.0` for reading and writing credentials using [`keytar`](https://github.com/atom/node-keytar)
- - `libXss.so.1` - the library for the X11 screen saver extension
- - `libgconf-2-4.so.4` - library for accessing GNOME configuration database
+ - `libsecret` for reading and writing credentials using [`keytar`](https://github.com/atom/node-keytar)
+   through the Secret Service API (GNOME Keyring, KWallet, KeePassXC, …)
+ - `rpmbuild` (optional) for creating `.rpm` packages
 
 Where to find these will vary based on your distribution, but below are some
 examples of distributions we've tested.
 
-### Fedora 26 and later
+### Fedora
 
 ```shellsession
-$ sudo dnf install -y libsecret-devel libXScrnSaver
+$ sudo dnf install -y libsecret-devel rpm-build
 ```
 
-### Ubuntu 14.04 and later
+### Ubuntu / Debian
 
 ```shellsession
-$ sudo apt install libsecret-1-dev libgconf-2-4
+$ sudo apt install libsecret-1-dev rpm
+```
+
+## Packaging
+
+`yarn build:prod && yarn package` creates the following packages in `dist/`:
+
+ - `github-desktop-<version>-amd64.deb`
+ - `github-desktop-<version>-x86_64.rpm` (only when `rpmbuild` is available)
+ - `github-desktop-<version>-x86_64.AppImage`
+
+Set `DESKTOP_LINUX_TARGETS` to a comma separated list (e.g. `deb,AppImage`) to
+only build some of them. The `.deb` and `.rpm` packages install a desktop entry
+which registers GitHub Desktop as the handler for its `x-github-client://` and
+sign-in URLs, so signing in through the browser requires one of them to be
+installed (or the AppImage to be integrated with your desktop).
+
+The `github` command line tool is included in the packages at
+`resources/app/static/github.sh` inside the install directory, link it into
+your `PATH` to use it:
+
+```shellsession
+$ sudo ln -s "/opt/GitHub Desktop/resources/app/static/github.sh" /usr/local/bin/github
+```
+
+## Wayland
+
+GitHub Desktop runs as a native Wayland application when started in a Wayland
+session, and falls back to X11 otherwise. Window decorations are drawn by the
+app itself (using your GTK theme), and input methods such as IBus and Fcitx are
+supported through the `text-input-v3` protocol.
+
+To force GitHub Desktop to run through XWayland instead, start it with:
+
+```shellsession
+$ github-desktop --ozone-platform=x11
 ```
 
 ## Back to setup

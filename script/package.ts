@@ -3,7 +3,11 @@
 import * as cp from 'child_process'
 import * as path from 'path'
 import * as electronInstaller from 'electron-winstaller'
-import { getProductName, getCompanyName } from '../app/package-info'
+import {
+  getProductName,
+  getCompanyName,
+  getBundleID,
+} from '../app/package-info'
 import {
   getDistPath,
   getOSXZipPath,
@@ -17,6 +21,8 @@ import {
   getDistRoot,
   getDistArchitecture,
   getIconDirectory,
+  getExecutableName,
+  getLinuxDesktopFileName,
 } from './dist-info'
 import { isGitHubActions } from './build-platforms'
 import { existsSync, rmSync, writeFileSync } from 'fs'
@@ -39,6 +45,8 @@ if (process.platform === 'darwin') {
   packageOSX()
 } else if (process.platform === 'win32') {
   packageWindows()
+} else if (process.platform === 'linux') {
+  packageLinux()
 } else {
   console.error(`I don't know how to package for ${process.platform} :(`)
   process.exit(1)
@@ -149,4 +157,137 @@ function packageWindows() {
       console.error(`Error packaging: ${e}`)
       process.exit(1)
     })
+}
+
+function getLinuxTargets() {
+  const requested = (process.env.DESKTOP_LINUX_TARGETS ?? 'deb,rpm,AppImage')
+    .split(',')
+    .map(t => t.trim())
+    .filter(t => t.length > 0)
+
+  // electron-builder needs rpmbuild from the host to create rpm packages,
+  // skip it rather than failing when building on a distro without it.
+  if (requested.includes('rpm') && !isCommandAvailable('rpmbuild')) {
+    console.warn('rpmbuild not found, skipping rpm package…')
+    return requested.filter(t => t !== 'rpm')
+  }
+
+  return requested
+}
+
+function isCommandAvailable(command: string) {
+  return cp.spawnSync('sh', ['-c', `command -v ${command}`]).status === 0
+}
+
+async function packageLinux() {
+  // electron-builder is only needed (and only loaded) when packaging on Linux
+  const { Arch, Platform, build } = await import('electron-builder')
+
+  const arch = getDistArchitecture()
+  // Matches the executable built by script/build.ts (github-desktop or
+  // github-desktop-dev) so dev and prod builds can be installed side by side.
+  const executableName = getExecutableName()
+
+  // The app registers either the production or the development auth protocol
+  // depending on whether it was built with OAuth secrets, which isn't known at
+  // this point. Declaring both is harmless as the app only claims the one it
+  // uses as the default handler at runtime.
+  const protocols = [
+    'x-github-desktop-auth',
+    'x-github-desktop-dev-auth',
+    'x-github-client',
+  ]
+
+  // Shared libraries Electron and keytar (libsecret) need at runtime that
+  // aren't guaranteed to be present on a minimal desktop install.
+  const debDepends = [
+    'libgtk-3-0 | libgtk-3-0t64',
+    'libnotify4',
+    'libnss3',
+    'libxss1',
+    'libxtst6',
+    'xdg-utils',
+    'libatspi2.0-0 | libatspi2.0-0t64',
+    'libuuid1',
+    'libsecret-1-0',
+    'libgbm1',
+    'libasound2 | libasound2t64',
+  ]
+
+  const rpmDepends = [
+    'gtk3',
+    'libnotify',
+    'nss',
+    'libXScrnSaver',
+    '(libXtst or libXtst6)',
+    'xdg-utils',
+    'at-spi2-core',
+    '(libuuid or libuuid1)',
+    'libsecret',
+    'mesa-libgbm',
+    '(alsa-lib or libasound2)',
+  ]
+
+  // electron-packager creates the app directory with 0700 permissions and
+  // file modes depend on the umask of the build machine. The packages copy
+  // these modes verbatim so normalize them to make the app usable by all
+  // users without being writable by anyone but its (root) owner.
+  cp.execSync(`chmod -R u+rwX,go+rX,go-w "${distPath}"`)
+  // Same goes for the files electron-builder generates (desktop entry etc.)
+  process.umask(0o022)
+
+  const targets = getLinuxTargets()
+  console.log(`Packaging for Linux (${targets.join(', ')})…`)
+
+  try {
+    const artifacts = await build({
+      targets: Platform.LINUX.createTarget(
+        targets,
+        arch === 'arm64' ? Arch.arm64 : Arch.x64
+      ),
+      prepackaged: distPath,
+      projectDir: path.resolve(__dirname, '..'),
+      publish: 'never',
+      config: {
+        appId: getBundleID(),
+        productName,
+        executableName,
+        electronVersion: require('../package.json').devDependencies.electron,
+        npmRebuild: false,
+        // Desktop doesn't use electron-updater, don't generate its app-update.yml
+        publish: null,
+        directories: { output: outputDir },
+        artifactName: `${executableName}-\${version}-\${arch}.\${ext}`,
+        // Mirrors the desktopName script/build.ts writes into the packaged
+        // app's package.json, electron-builder uses it to name the desktop
+        // entry and its StartupWMClass to match Electron's app_id / WM_CLASS.
+        extraMetadata: { desktopName: getLinuxDesktopFileName() },
+        linux: {
+          syncDesktopName: true,
+          icon: path.resolve(__dirname, '../app/static/linux/icon-logo.png'),
+          category: 'Development',
+          maintainer: `${getCompanyName()} <opensource+desktop@github.com>`,
+          vendor: getCompanyName(),
+          synopsis: 'Simple collaboration from your desktop',
+          mimeTypes: protocols.map(p => `x-scheme-handler/${p}`),
+          desktop: {
+            entry: {
+              Name: productName,
+              Comment: 'Simple collaboration from your desktop',
+              Keywords: 'git;github;version control;',
+            },
+          },
+        },
+        deb: { packageName: executableName, depends: debDepends },
+        rpm: { packageName: executableName, depends: rpmDepends },
+      },
+    })
+
+    for (const artifact of artifacts) {
+      console.log(`Created ${artifact}`)
+    }
+  } catch (e) {
+    console.error(`Error packaging: ${e}`)
+    process.exit(1)
+  }
 }

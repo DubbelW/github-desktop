@@ -26,7 +26,7 @@ export function getExecutableName() {
   if (process.platform === 'win32') {
     return `${getWindowsIdentifierName()}${suffix}`
   } else if (process.platform === 'linux') {
-    return 'desktop'
+    return `${getLinuxIdentifierName()}${suffix}`
   } else {
     return productName
   }
@@ -96,6 +96,20 @@ export function getWindowsDeltaNugetPackagePath() {
 
 export function getWindowsIdentifierName() {
   return 'GitHubDesktop'
+}
+
+export function getLinuxIdentifierName() {
+  return 'github-desktop'
+}
+
+/**
+ * The name of the freedesktop.org desktop entry for this build. Electron uses
+ * it (via `desktopName` in package.json) as the Wayland app_id and X11
+ * WM_CLASS, and when registering us as a protocol handler, so it has to match
+ * the desktop entry installed by the Linux packages.
+ */
+export function getLinuxDesktopFileName() {
+  return `${getExecutableName()}.desktop`
 }
 
 export function getBundleSizes() {

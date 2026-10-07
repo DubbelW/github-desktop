@@ -37,6 +37,7 @@ import {
   getDistRoot,
   getExecutableName,
   getIconDirectory,
+  getLinuxDesktopFileName,
   isPublishable,
 } from './dist-info'
 
@@ -171,11 +172,17 @@ function packageApp() {
   }
 
   const iconPath = getIconDirectory()
-  const assetsCarPath = join(iconPath, 'Assets.car')
-  assert(
-    existsSync(assetsCarPath),
-    `Unable to find Assets.car at ${assetsCarPath}`
-  )
+  const extraResource = new Array<string>()
+
+  // Linux uses a plain png icon (see app/static/linux) instead of Assets.car
+  if (process.platform !== 'linux') {
+    const assetsCarPath = join(iconPath, 'Assets.car')
+    assert(
+      existsSync(assetsCarPath),
+      `Unable to find Assets.car at ${assetsCarPath}`
+    )
+    extraResource.push(assetsCarPath)
+  }
 
   return packager({
     name: getExecutableName(),
@@ -184,7 +191,7 @@ function packageApp() {
     asar: false, // TODO: Probably wanna enable this down the road.
     out: getDistRoot(),
     icon: join(iconPath, 'icon-logo'),
-    extraResource: [assetsCarPath],
+    extraResource,
     dir: outRoot,
     overwrite: true,
     tmpdir: false,
@@ -310,6 +317,10 @@ function copyDependencies() {
   // The product name changes depending on whether it's a prod build or dev
   // build, so that we can have them running side by side.
   pkg.productName = getProductName()
+
+  if (process.platform === 'linux') {
+    pkg.desktopName = getLinuxDesktopFileName()
+  }
   pkg.dependencies = filterExternals(pkg.dependencies)
   pkg.devDependencies =
     isDevelopmentBuild && pkg.devDependencies

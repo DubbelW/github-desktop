@@ -26,6 +26,13 @@ const run = (...args: Array<string>) => {
       .on('error', cb)
       .on('exit', code => (process.exitCode = code ?? process.exitCode))
       .unref()
+  } else if (process.platform === 'linux') {
+    // The CLI is run by the app binary itself (ELECTRON_RUN_AS_NODE) so we
+    // can relaunch it in app mode through process.execPath.
+    spawn(process.execPath, args, { detached: true, stdio: 'ignore' })
+      .on('error', cb)
+      .on('exit', code => (process.exitCode = code ?? process.exitCode))
+      .unref()
   } else {
     throw new Error('Unsupported platform')
   }

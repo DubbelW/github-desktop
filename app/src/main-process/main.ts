@@ -51,6 +51,7 @@ import {
 import { initializeDesktopNotifications } from './notifications'
 import parseCommandLineArgs from 'minimist'
 import { CLIAction } from '../lib/cli-action'
+import { removeLeakedSnapEnvironment } from './snap-environment'
 
 app.setAppLogsPath()
 enableSourceMaps()
@@ -256,18 +257,7 @@ async function handleCommandLineArguments(argv: string[]) {
     // sure that Chromium won't add more switches later on which is why we have
     // to resort to looking through all arguments looking for something that
     // appears to be an app url.
-    const prefixes = Array.from(possibleProtocols, p => `${p}://`)
-    const matchingUrl = argv.find(arg => {
-      if (prefixes.some(p => arg.startsWith(p))) {
-        try {
-          new URL(arg)
-          return true
-        } catch (e) {
-          log.error(`Unable to parse argument as URL: ${arg}`)
-        }
-      }
-      return false
-    })
+    const matchingUrl = findAppURLArgument(argv)
 
     if (matchingUrl) {
       handleAppURL(matchingUrl)
@@ -277,6 +267,19 @@ async function handleCommandLineArguments(argv: string[]) {
     // If --protocol-launcher is present we always want to bail and not
     // risk a smuggled cli switch
     return
+  }
+
+  if (__LINUX__) {
+    // On Linux, xdg-open launches us through our desktop entry
+    // (`Exec=github-desktop %U`) with the app url as a plain argument, both
+    // for the initial launch and when forwarded through `second-instance`.
+    const matchingUrl = findAppURLArgument(argv)
+
+    if (matchingUrl) {
+      handleAppURL(matchingUrl)
+      // Same as on Windows, never process cli switches alongside an app url.
+      return
+    }
   }
 
   if (typeof args['cli-open'] === 'string') {
@@ -291,6 +294,25 @@ async function handleCommandLineArguments(argv: string[]) {
   }
 
   return
+}
+
+/**
+ * Look through the given arguments for one that appears to be a valid url
+ * using one of our registered protocols.
+ */
+function findAppURLArgument(argv: ReadonlyArray<string>) {
+  const prefixes = Array.from(possibleProtocols, p => `${p}://`)
+  return argv.find(arg => {
+    if (prefixes.some(p => arg.startsWith(p))) {
+      try {
+        new URL(arg)
+        return true
+      } catch (e) {
+        log.error(`Unable to parse argument as URL: ${arg}`)
+      }
+    }
+    return false
+  })
 }
 
 function handleCLIAction(action: CLIAction) {
@@ -321,6 +343,18 @@ if (process.env.GITHUB_DESKTOP_DISABLE_HARDWARE_ACCELERATION) {
     `GITHUB_DESKTOP_DISABLE_HARDWARE_ACCELERATION environment variable set, disabling hardware acceleration`
   )
   app.disableHardwareAcceleration()
+}
+
+if (__LINUX__) {
+  removeLeakedSnapEnvironment(process.env, process.execPath)
+
+  // Electron runs as a native Wayland client by default when launched in a
+  // Wayland session (falling back to X11 otherwise, or when started with
+  // `--ozone-platform=x11`). Input methods such as IBus and Fcitx need the
+  // text-input-v3 protocol to work under Wayland, which Chromium doesn't
+  // enable by default. These switches are ignored when running on X11.
+  app.commandLine.appendSwitch('enable-wayland-ime')
+  app.commandLine.appendSwitch('wayland-text-input-version', '3')
 }
 
 app.on('ready', () => {
