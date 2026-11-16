@@ -59,7 +59,9 @@ import {
   mkdirSync,
   readdirSync,
   readFileSync,
+  readlinkSync,
   rmSync,
+  symlinkSync,
   unlinkSync,
   writeFileSync,
 } from 'fs'
@@ -220,7 +222,17 @@ async function packageApp() {
     dir: outRoot,
     overwrite: true,
     tmpdir: false,
-    derefSymlinks: true,
+    // Dereferencing is needed for signed macOS builds, but on Linux it turns
+    // the ~145 symlinks in Git's libexec/git-core into full copies of the git
+    // binary, adding ~600MB to the package.
+    derefSymlinks: process.platform !== 'linux',
+    afterCopy:
+      process.platform === 'linux'
+        ? [
+            ({ buildPath }: { buildPath: string }) =>
+              restoreRelativeSymlinks(buildPath, outRoot),
+          ]
+        : [],
     prune: false, // We'll prune them ourselves below.
     ignore: [
       new RegExp('/node_modules/electron($|/)'),
@@ -271,6 +283,52 @@ async function packageApp() {
       InternalName: getProductName(),
     },
   })
+}
+
+/**
+ * `@electron/packager` copies the app with `fs.cp` without `verbatimSymlinks`,
+ * which turns relative symlinks (such as Git's libexec/git-core/git-* links)
+ * into absolute links pointing back into `sourceRoot` on the build machine.
+ * Point them at the same file inside the packaged app again, relatively.
+ */
+function restoreRelativeSymlinks(buildPath: string, sourceRoot: string) {
+  const walk = (dir: string) => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const entryPath = path.join(dir, entry.name)
+
+      if (entry.isDirectory()) {
+        walk(entryPath)
+        continue
+      }
+
+      if (!entry.isSymbolicLink()) {
+        continue
+      }
+
+      const target = readlinkSync(entryPath)
+      if (!path.isAbsolute(target)) {
+        continue
+      }
+
+      const relativeToSource = path.relative(sourceRoot, target)
+      if (
+        relativeToSource.startsWith(`..${path.sep}`) ||
+        path.isAbsolute(relativeToSource)
+      ) {
+        console.warn(`Leaving symlink outside of the app as is: ${entryPath}`)
+        continue
+      }
+
+      const newTarget = path.relative(
+        path.dirname(entryPath),
+        path.join(buildPath, relativeToSource)
+      )
+      unlinkSync(entryPath)
+      symlinkSync(newTarget, entryPath)
+    }
+  }
+
+  walk(buildPath)
 }
 
 function removeAndCopy(source: string, destination: string) {
