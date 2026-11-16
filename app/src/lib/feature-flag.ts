@@ -3,6 +3,12 @@ import { Account } from '../models/account'
 const Disable = false
 
 /**
+ * Opt in new OAuth authorizations for beta and development features.
+ * Other builds use Central's rollout; existing credentials keep renewing.
+ */
+export const enableShortLivedTokens = () => enableBetaFeatures()
+
+/**
  * Enables the application to opt-in for preview features based on runtime
  * checks. This is backed by the GITHUB_DESKTOP_PREVIEW_FEATURES environment
  * variable, which is checked for non-development environments.
@@ -125,3 +131,12 @@ export const enableFormattingPreferences = () => true
 
 /** Should the app enable worktree support? */
 export const enableWorktreeSupport = () => true
+
+/** Should the app offer handoff to the GitHub Copilot app? */
+export const enableCopilotAppHandoff = () =>
+  (__DARWIN__ || __WIN32__) && enableBetaFeatures()
+
+/** Should stats be sent to the new telemetry endpoint? */
+export function enableNewStatsEndpoint(): boolean {
+  return true
+}

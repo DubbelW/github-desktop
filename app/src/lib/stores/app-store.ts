@@ -13,8 +13,19 @@ import {
   SignInStore,
   UpstreamRemoteName,
 } from '.'
-import type { CopilotFeature, CopilotModelSelections } from './copilot-store'
-import { CommitMessageGenerationCancelledError } from './copilot-store'
+import type {
+  CopilotFeature,
+  CopilotModelSelections,
+  CopilotModelSelectionsByAccount,
+  CopilotModelsByAccount,
+  CopilotQuotaSnapshots,
+  CopilotQuotaSnapshotsByAccount,
+} from './copilot-store'
+import {
+  CommitMessageGenerationCancelledError,
+  getCopilotAccountCacheKey,
+  migrateCopilotModelSelectionsToAccounts,
+} from './copilot-store'
 import {
   IBYOKProvider,
   loadBYOKProviders,
@@ -29,7 +40,11 @@ import type {
   CopilotModelRequest,
   CopilotProviderConfig,
 } from './copilot-store'
-import { Account, isDotComAccount } from '../../models/account'
+import {
+  Account,
+  CopilotLicenseTypeNoAccess,
+  isDotComAccount,
+} from '../../models/account'
 import { AppMenu, IMenu } from '../../models/app-menu'
 import { Author } from '../../models/author'
 import { Branch, BranchType, IAheadBehind } from '../../models/branch'
@@ -82,6 +97,8 @@ import {
   WorkingDirectoryFileChange,
   WorkingDirectoryStatus,
   AppFileStatusKind,
+  isConflictedFileStatus,
+  GitStatusEntry,
 } from '../../models/status'
 import { TipState, tipEquals, IValidBranch } from '../../models/tip'
 import {
@@ -211,6 +228,7 @@ import {
   getRepositoryType,
   RepositoryType,
   listWorktrees,
+  resolveMainWorktreePath,
   removeWorktree,
   moveWorktree,
   getCommitRangeDiff,
@@ -275,6 +293,11 @@ import {
   getFloatNumber,
 } from '../local-storage'
 import { ExternalEditorError, suggestedExternalEditor } from '../editors/shared'
+import {
+  CopilotAppError,
+  findCopilotApp,
+  openInCopilotApp,
+} from '../copilot-app'
 import { ApiRepositoriesStore } from './api-repositories-store'
 import {
   updateChangedFiles,
@@ -285,6 +308,7 @@ import { ManualConflictResolution } from '../../models/manual-conflict-resolutio
 import { BranchPruner } from './helpers/branch-pruner'
 import {
   enableCopilotConflictResolution,
+  enableCopilotAppHandoff,
   enableCopilotSdkCommitMessageGeneration,
   enableCustomIntegration,
   enableWorktreeSupport,
@@ -314,7 +338,11 @@ import {
   isValidTutorialStep,
 } from '../../models/tutorial-step'
 import { OnboardingTutorialAssessor } from './helpers/tutorial-assessor'
-import { getConflictedFiles, getUntrackedFiles } from '../status'
+import {
+  getConflictedFiles,
+  getUntrackedFiles,
+  hasUnresolvedConflicts,
+} from '../status'
 import { isBranchPushable } from '../helpers/push-control'
 import {
   findAssociatedPullRequest,
@@ -323,6 +351,10 @@ import {
 import { parseRemote } from '../../lib/remote-parsing'
 import { createTutorialRepository } from './helpers/create-tutorial-repository'
 import { sendNonFatalException } from '../helpers/non-fatal-exception'
+import {
+  CopilotConflictResolutionError,
+  CopilotConflictResolutionFailureStage,
+} from '../copilot-conflict-resolution-error'
 import { getDefaultDir } from '../../ui/lib/default-dir'
 import { WorkflowPreferences } from '../../models/workflow-preferences'
 import { RepositoryIndicatorUpdater } from './helpers/repository-indicator-updater'
@@ -397,6 +429,7 @@ import {
   IConflictResolutionProgress,
   ICopilotResolutionSummary,
   IFileResolution,
+  ICopilotSkippedFile,
 } from '../copilot-conflict-resolution'
 import {
   buildConflictContext,
@@ -410,8 +443,13 @@ import {
   findPullRequestsByNumbers,
 } from '../pull-request-refs'
 import { resolveWithin } from '../path'
-import { WorktreeEntry } from '../../models/worktree'
-import type { Model } from '@github/copilot-sdk/dist/generated/rpc'
+import {
+  IDeferredCheckout,
+  IDeleteWorktreeOptions,
+  WorktreeEntry,
+} from '../../models/worktree'
+import { shouldShowWorktreeDropdown } from '../worktree-dropdown'
+import type { Model } from '../copilot/types'
 
 const LastSelectedRepositoryIDKey = 'last-selected-repository-id'
 
@@ -520,6 +558,7 @@ const pullRequestSuggestedNextActionKey =
 
 export const useCustomEditorKey = 'use-custom-editor'
 const customEditorKey = 'custom-editor'
+const copilotAppPathKey = 'copilot-app-path'
 
 export const useCustomShellKey = 'use-custom-shell'
 const customShellKey = 'custom-shell'
@@ -529,6 +568,8 @@ export const underlineLinksDefault = true
 
 export const showDiffCheckMarksDefault = true
 export const showDiffCheckMarksKey = 'diff-check-marks-visible'
+
+const alwaysShowWorktreeListKey = 'always-show-worktree-list'
 
 const commitMessageGenerationDisclaimerLastSeenKey =
   'commit-message-generation-disclaimer-last-seen'
@@ -547,7 +588,10 @@ const alwaysUseCopilotForConflictResolutionKey =
 
 export const showChangesFilterKey = 'show-changes-filter'
 
+// TODO: to be removed after the migration period. Now Copilot models are stored
+// per account, not globally.
 const selectedCopilotModelsKey = 'selected-copilot-models'
+const selectedCopilotModelsByAccountKey = 'selected-copilot-models-by-account'
 export const showChangesFilterDefault = true
 
 export class AppStore extends TypedBaseStore<IAppState> {
@@ -685,6 +729,7 @@ export class AppStore extends TypedBaseStore<IAppState> {
 
   private useCustomEditor: boolean = false
   private customEditor: ICustomIntegration | null = null
+  private copilotAppPath: string | null = null
 
   private useCustomShell: boolean = false
   private customShell: ICustomIntegration | null = null
@@ -699,6 +744,7 @@ export class AppStore extends TypedBaseStore<IAppState> {
     | undefined = undefined
 
   private showDiffCheckMarks: boolean = showDiffCheckMarksDefault
+  private alwaysShowWorktreeList: boolean = false
 
   private preferAbsoluteDates: boolean = false
 
@@ -716,8 +762,11 @@ export class AppStore extends TypedBaseStore<IAppState> {
 
   private showChangesFilter: boolean = false
 
-  private selectedCopilotModels: CopilotModelSelections = {}
-  private copilotModels: ReadonlyArray<Model> | null = null
+  private selectedCopilotModelsByAccount: CopilotModelSelectionsByAccount =
+    new Map()
+  private copilotModelsByAccount: CopilotModelsByAccount = new Map()
+  private copilotQuotaSnapshotsByAccount: CopilotQuotaSnapshotsByAccount =
+    new Map()
   private byokProviders: ReadonlyArray<IBYOKProvider> = []
 
   public constructor(
@@ -794,8 +843,6 @@ export class AppStore extends TypedBaseStore<IAppState> {
       }
     }, InitialRepositoryIndicatorTimeout)
 
-    API.onTokenInvalidated(this.onTokenInvalidated)
-
     this.notificationsStore.onChecksFailedNotification(
       this.onChecksFailedNotification
     )
@@ -854,31 +901,6 @@ export class AppStore extends TypedBaseStore<IAppState> {
     }
 
     return zoomFactor
-  }
-
-  private onTokenInvalidated = (endpoint: string, token: string) => {
-    const account = getAccountForEndpoint(this.accounts, endpoint)
-
-    if (account === null) {
-      return
-    }
-
-    // If we have a token for the account but it doesn't match the token that
-    // was invalidated that likely means that someone held onto an account for
-    // longer than they should have which is bad but what's even worse is if we
-    // invalidate an active account.
-    if (account.token && account.token !== token) {
-      log.error(`Token for ${endpoint} invalidated but token mismatch`)
-      return
-    }
-
-    // If the token was invalidated for an account, sign out from that account
-    this._removeAccount(account)
-
-    this._showPopup({
-      type: PopupType.InvalidatedToken,
-      account,
-    })
   }
 
   private onShowInstallingUpdate = () => {
@@ -998,14 +1020,21 @@ export class AppStore extends TypedBaseStore<IAppState> {
 
     this.cloningRepositoriesStore.onDidError(e => this.emitError(e))
 
-    this.signInStore.onDidAuthenticate(account => this._addAccount(account))
+    this.signInStore.onDidAuthenticate(account =>
+      this.onDidAuthenticate(account)
+    )
     this.signInStore.onDidUpdate(() => this.emitUpdate())
     this.signInStore.onDidError(error => this.emitError(error))
 
     this.accountsStore.onDidUpdate(accounts => {
       this.accounts = accounts
+      this.statsStore.setUsesShortLivedToken(
+        accounts.some(account => this.accountsStore.isRefreshable(account))
+      )
       this.syncCopilotModelsFromCache()
+      this.syncCopilotQuotaSnapshotsFromCache()
       this.updateCopilotModelsForCurrentAccount()
+      this.updateCopilotQuotaSnapshotsForCurrentAccount()
       const endpointTokens = accounts.map<EndpointToken>(
         ({ endpoint, token }) => ({ endpoint, token })
       )
@@ -1017,6 +1046,14 @@ export class AppStore extends TypedBaseStore<IAppState> {
       this.emitUpdate()
     })
     this.accountsStore.onDidError(error => this.emitError(error))
+    this.accountsStore.onTokenRefreshEvent(event => {
+      void this.statsStore.recordTokenRefreshEvent(event).catch(error => {
+        log.error('Failed recording token refresh stats', error)
+      })
+    })
+    this.accountsStore.onTokenInvalidated(account => {
+      this._showPopup({ type: PopupType.InvalidatedToken, account })
+    })
 
     this.repositoriesStore.onDidUpdate(updateRepositories => {
       this.repositories = updateRepositories
@@ -1045,43 +1082,91 @@ export class AppStore extends TypedBaseStore<IAppState> {
 
     this.copilotStore.onDidUpdate(() => {
       this.syncCopilotModelsFromCache()
+      this.syncCopilotQuotaSnapshotsFromCache()
       this.emitUpdate()
     })
   }
 
-  private getCopilotModelsAccount(): Account | undefined {
-    return this.accounts.find(
+  private getCopilotSettingsAccounts(): ReadonlyArray<Account> {
+    return this.accounts.filter(
       account =>
         !isGHES(account.endpoint) &&
         enableCopilotSdkCommitMessageGeneration(account) &&
-        account.isCopilotDesktopEnabled
+        account.isCopilotDesktopEnabled === true &&
+        account.copilotLicenseType !== undefined &&
+        account.copilotLicenseType !== CopilotLicenseTypeNoAccess
     )
   }
 
   private syncCopilotModelsFromCache(): void {
-    const account = this.getCopilotModelsAccount()
+    const accounts = this.getCopilotSettingsAccounts()
+    const copilotModelsByAccount = new Map<
+      string,
+      ReadonlyArray<Model> | null
+    >()
 
-    if (account === undefined) {
-      this.copilotModels = null
-      return
+    for (const account of accounts) {
+      copilotModelsByAccount.set(
+        getCopilotAccountCacheKey(account),
+        this.copilotStore.getCachedModelList(account)
+      )
     }
 
-    this.copilotModels = this.copilotStore.getCachedModelList(account)
+    this.copilotModelsByAccount = copilotModelsByAccount
+  }
+
+  private syncCopilotQuotaSnapshotsFromCache(): void {
+    const accounts = this.getCopilotSettingsAccounts()
+    const copilotQuotaSnapshotsByAccount = new Map<
+      string,
+      CopilotQuotaSnapshots | null
+    >()
+
+    for (const account of accounts) {
+      copilotQuotaSnapshotsByAccount.set(
+        getCopilotAccountCacheKey(account),
+        this.copilotStore.getCachedQuotaSnapshots(account)
+      )
+    }
+
+    this.copilotQuotaSnapshotsByAccount = copilotQuotaSnapshotsByAccount
   }
 
   private updateCopilotModelsForCurrentAccount(): void {
-    const account = this.getCopilotModelsAccount()
+    const accounts = this.getCopilotSettingsAccounts()
 
     if (
-      account === undefined ||
-      this.copilotStore.getCachedModelList(account) !== null
+      accounts.length === 0 ||
+      accounts.every(
+        account => this.copilotStore.getCachedModelList(account) !== null
+      )
     ) {
       return
     }
 
-    this.fetchCopilotModelsForCurrentAccount().catch(e => {
+    this.fetchCopilotModelsForCurrentAccounts().catch(e => {
       log.warn(
         'AppStore: Failed to fetch Copilot models after account update',
+        e
+      )
+    })
+  }
+
+  private updateCopilotQuotaSnapshotsForCurrentAccount(): void {
+    const accounts = this.getCopilotSettingsAccounts()
+
+    if (
+      accounts.length === 0 ||
+      accounts.every(
+        account => this.copilotStore.getCachedQuotaSnapshots(account) !== null
+      )
+    ) {
+      return
+    }
+
+    this.fetchCopilotQuotaSnapshotsForCurrentAccounts().catch(e => {
+      log.warn(
+        'AppStore: Failed to fetch Copilot quota snapshots after account update',
         e
       )
     })
@@ -1256,6 +1341,7 @@ export class AppStore extends TypedBaseStore<IAppState> {
       customEditor: this.customEditor,
       useCustomShell: this.useCustomShell,
       customShell: this.customShell,
+      copilotAppPath: this.copilotAppPath,
       showCIStatusPopover: this.showCIStatusPopover,
       notificationsEnabled: getNotificationsEnabled(),
       pullRequestSuggestedNextAction: this.pullRequestSuggestedNextAction,
@@ -1263,6 +1349,7 @@ export class AppStore extends TypedBaseStore<IAppState> {
       cachedRepoRulesets: this.cachedRepoRulesets,
       underlineLinks: this.underlineLinks,
       showDiffCheckMarks: this.showDiffCheckMarks,
+      alwaysShowWorktreeList: this.alwaysShowWorktreeList,
       preferAbsoluteDates: this.preferAbsoluteDates,
       updateState: updateStore.state,
       commitMessageGenerationDisclaimerLastSeen:
@@ -1276,8 +1363,9 @@ export class AppStore extends TypedBaseStore<IAppState> {
       alwaysUseCopilotForConflictResolution:
         this.alwaysUseCopilotForConflictResolution,
       showChangesFilter: this.showChangesFilter,
-      selectedCopilotModels: this.selectedCopilotModels,
-      copilotModels: this.copilotModels,
+      selectedCopilotModelsByAccount: this.selectedCopilotModelsByAccount,
+      copilotModelsByAccount: this.copilotModelsByAccount,
+      copilotQuotaSnapshotsByAccount: this.copilotQuotaSnapshotsByAccount,
       byokProviders: this.byokProviders,
     }
   }
@@ -2349,6 +2437,10 @@ export class AppStore extends TypedBaseStore<IAppState> {
 
     this.accounts = accounts
     this.repositories = repositories
+    this.statsStore.setUsesShortLivedToken(
+      accounts.some(account => this.accountsStore.isRefreshable(account))
+    )
+    this.alwaysShowWorktreeList = getBoolean(alwaysShowWorktreeListKey, false)
 
     this.updateRepositorySelectionAfterRepositoriesChanged()
 
@@ -2503,6 +2595,7 @@ export class AppStore extends TypedBaseStore<IAppState> {
     this.useCustomEditor =
       enableCustomIntegration() && getBoolean(useCustomEditorKey, false)
     this.customEditor = getObject<ICustomIntegration>(customEditorKey) ?? null
+    this.copilotAppPath = localStorage.getItem(copilotAppPathKey)
 
     this.useCustomShell =
       enableCustomIntegration() && getBoolean(useCustomShellKey, false)
@@ -2569,7 +2662,9 @@ export class AppStore extends TypedBaseStore<IAppState> {
       showChangesFilterDefault
     )
 
-    this.selectedCopilotModels = this.loadCopilotModelSelections()
+    this.selectedCopilotModelsByAccount =
+      this.loadCopilotModelSelectionsByAccount()
+    this.migrateCopilotModelSelections()
     this.byokProviders = loadBYOKProviders()
 
     this.emitUpdateNow()
@@ -2582,27 +2677,24 @@ export class AppStore extends TypedBaseStore<IAppState> {
   /**
    * Determine whether the worktree dropdown is currently shown in the toolbar.
    *
-   * This mirrors the render condition in `App.renderWorktreeToolbarButton`: the
-   * dropdown is shown when worktree support is enabled and either the selected
-   * repository has at least one linked worktree (i.e. more than just the main
-   * worktree) or the worktree foldout is currently open (which lets the user
-   * create their first worktree from the toolbar).
+   * Shares the render condition in `App.renderWorktreeToolbarButton` so that
+   * the toolbar reserves space for the dropdown whenever it is visible.
    */
   private isWorktreeDropdownVisible(): boolean {
     if (!enableWorktreeSupport()) {
       return false
     }
 
-    if (this.currentFoldout?.type === FoldoutType.Worktree) {
-      return true
+    const repository = this.selectedRepository
+    if (!(repository instanceof Repository)) {
+      return false
     }
 
-    const repository = this.selectedRepository
-    const worktreeCount =
-      repository instanceof Repository
-        ? this.repositoryStateCache.get(repository).worktrees.length
-        : 0
-    return worktreeCount > 1
+    return shouldShowWorktreeDropdown(
+      this.repositoryStateCache.get(repository).worktrees.length,
+      this.currentFoldout?.type === FoldoutType.Worktree,
+      this.alwaysShowWorktreeList
+    )
   }
 
   /**
@@ -3887,7 +3979,79 @@ export class AppStore extends TypedBaseStore<IAppState> {
       }
       return recovered
     }
+
+    const recoveredWorktree = await this.recoverMissingWorktree(repository)
+    if (recoveredWorktree !== null) {
+      return recoveredWorktree
+    }
+
     return repository
+  }
+
+  /**
+   * Ask a worktree that exists on disk which worktree is the main one, or
+   * undefined if git can't tell us.
+   */
+  private findMainWorktreePath(path: string): Promise<string | undefined> {
+    return listWorktrees(path)
+      .then(worktrees => worktrees.find(wt => wt.type === 'main')?.path)
+      .catch(e => {
+        log.error(`Could not list worktrees in '${path}'`, e)
+        return undefined
+      })
+  }
+
+  private async recoverMissingWorktree(
+    repository: Repository
+  ): Promise<Repository | null> {
+    const mainWorktreePath = await resolveMainWorktreePath(repository).catch(
+      e => {
+        log.error('Could not resolve the main worktree path', e)
+        return null
+      }
+    )
+
+    if (mainWorktreePath === null) {
+      return null
+    }
+
+    const type = await getRepositoryType(mainWorktreePath).catch(e => {
+      log.error('Could not determine main worktree repository type', e)
+      return { kind: 'missing' } as RepositoryType
+    })
+
+    if (type.kind !== 'regular') {
+      return null
+    }
+
+    const result = await this.repositoriesStore.switchWorktree(
+      repository,
+      type.topLevelWorkingDirectory,
+      false,
+      type.gitDir,
+      type.topLevelWorkingDirectory
+    )
+
+    if (!result.existingRepository) {
+      // The main worktree exists, so its own worktree list is readable even
+      // when the metadata belonging to the removed worktree isn't.
+      const mainWorktree = await listWorktrees(type.topLevelWorkingDirectory)
+        .then(worktrees => worktrees.find(wt => wt.type === 'main'))
+        .catch(e => {
+          log.error('Could not list worktrees from the main worktree', e)
+          return undefined
+        })
+
+      if (mainWorktree !== undefined) {
+        this.repositoryStateCache.seedFromWorktree(
+          result.repository,
+          repository,
+          mainWorktree
+        )
+      }
+    }
+
+    return result.repository
   }
 
   /** This shouldn't be called directly. See `Dispatcher`. */
@@ -3900,6 +4064,21 @@ export class AppStore extends TypedBaseStore<IAppState> {
     // set the flag and don't try anything Git-related
     const exists = await pathExists(repository.path)
     if (!exists) {
+      const recoveredWorktree = await this.recoverMissingWorktree(repository)
+
+      if (recoveredWorktree !== null) {
+        if (
+          this.selectedRepository instanceof Repository &&
+          this.selectedRepository.id === repository.id
+        ) {
+          await this._selectRepository(recoveredWorktree)
+        } else {
+          await this._refreshRepository(recoveredWorktree)
+        }
+
+        return
+      }
+
       this._updateRepositoryMissing(repository, true)
       return
     }
@@ -4070,10 +4249,18 @@ export class AppStore extends TypedBaseStore<IAppState> {
     // focus event. No point in having the RepositoryIndicatorUpdater do
     // it as well.
     //
+    // Repository-list reloads can create a different object for the selected
+    // database row, so compare IDs rather than references. Cloning selections
+    // aren't local repositories and must not exclude an entry with the same ID.
+    //
     // Note that this method should never leak the actual repositories
     // instance since that's a mutable array. We should always return
     // a copy.
-    return this.repositories.filter(x => x !== this.selectedRepository)
+    const selectedRepositoryID =
+      this.selectedRepository instanceof Repository
+        ? this.selectedRepository.id
+        : null
+    return this.repositories.filter(x => x.id !== selectedRepositoryID)
   }
 
   /**
@@ -4423,10 +4610,23 @@ export class AppStore extends TypedBaseStore<IAppState> {
     }
 
     // If the branch is checked out in another worktree, switch to that worktree
-    // instead of checking out the branch in the current worktree.
-    const wt = repositoryState.worktrees.find(wt => wt.branch === branch.ref)
+    // instead of checking out the branch in the current worktree. Git considers
+    // a branch held by a worktree whose folder has gone to still be in use, so
+    // that worktree has to be removed before the branch can be checked out.
+    await this._refreshWorktrees(repository)
+    const wt = this.repositoryStateCache
+      .get(repository)
+      .worktrees.find(wt => wt.branch === branch.ref)
 
     if (wt) {
+      if (wt.isPrunable) {
+        this._requestDeleteWorktree(repository, wt.path, {
+          branch,
+          strategy: explicitStrategy,
+        })
+        return repository
+      }
+
       return this._switchWorktree(repository, wt)
     }
 
@@ -4782,6 +4982,9 @@ export class AppStore extends TypedBaseStore<IAppState> {
     const api = API.fromAccount(account)
 
     const branches = await api.fetchProtectedBranches(owner.login, name)
+    if (branches === null) {
+      return
+    }
 
     await this.repositoriesStore.updateBranchProtections(
       repository.gitHubRepository,
@@ -5883,12 +6086,12 @@ export class AppStore extends TypedBaseStore<IAppState> {
     repository: Repository,
     worktree: WorktreeEntry
   ): Promise<Repository> {
-    const { kind } = await getRepositoryType(worktree.path).catch(e => {
+    const type = await getRepositoryType(worktree.path).catch(e => {
       log.error('Could not determine repository type', e)
       return { kind: 'missing' } as RepositoryType
     })
 
-    if (kind !== 'regular' && kind !== 'unsafe') {
+    if (type.kind !== 'regular' && type.kind !== 'unsafe') {
       throw new Error(
         `The worktree path '${worktree.path}' does not appear to be a valid Git repository.`
       )
@@ -5897,12 +6100,25 @@ export class AppStore extends TypedBaseStore<IAppState> {
     // If the repository path isn't trusted we'll mark the repository as
     // missing. The missing repository view knows how to add a path to the
     // allow list.
-    const missing = kind === 'unsafe'
+    const missing = type.kind === 'unsafe'
+    const gitDir = type.kind === 'regular' ? type.gitDir : undefined
+
+    // Record the main worktree while the worktree set is still readable.
+    // Removing a worktree can take its git metadata with it, leaving nothing to
+    // resolve it from afterwards. Only attempted for a regular repository —
+    // git won't run at all in one it considers unsafe — and `switchWorktree`
+    // keeps the previously recorded path when this is undefined.
+    const mainWorktreePath =
+      type.kind === 'regular'
+        ? await this.findMainWorktreePath(worktree.path)
+        : undefined
 
     const result = await this.repositoriesStore.switchWorktree(
       repository,
       worktree.path,
-      missing
+      missing,
+      gitDir,
+      mainWorktreePath
     )
 
     this.repositoryStateCache.seedFromWorktree(
@@ -5921,16 +6137,23 @@ export class AppStore extends TypedBaseStore<IAppState> {
   /** This shouldn't be called directly. See 'Dispatcher'. */
   public _requestDeleteWorktree(
     repository: Repository,
-    worktreePath: string
+    worktreePath: string,
+    checkout?: IDeferredCheckout
   ): void {
-    if (this.confirmWorktreeRemoval) {
+    const wt = this.repositoryStateCache
+      .get(repository)
+      .worktrees.find(wt => wt.path === worktreePath)
+    const options = { isMissing: wt?.isPrunable === true, checkout }
+
+    if (this.confirmWorktreeRemoval || options.isMissing) {
       this._showPopup({
         type: PopupType.DeleteWorktree,
         repository,
         worktreePath,
+        options,
       })
     } else {
-      this._deleteWorktree(repository, worktreePath).catch(e =>
+      this._deleteWorktree(repository, worktreePath, options).catch(e =>
         this.emitError(e)
       )
     }
@@ -5940,8 +6163,27 @@ export class AppStore extends TypedBaseStore<IAppState> {
   public async _deleteWorktree(
     repository: Repository,
     worktreePath: string,
-    force?: boolean
+    options: IDeleteWorktreeOptions = {}
   ): Promise<void> {
+    if (options.isMissing === true) {
+      const worktrees = await listWorktrees(repository)
+
+      if (!worktrees.some(wt => wt.path === worktreePath && wt.isPrunable)) {
+        await this._refreshWorktrees(repository)
+
+        if (options.checkout === undefined) {
+          const name = Path.basename(worktreePath)
+          this.emitError(
+            new Error(
+              `The worktree ${name} is available again and was left in place.`
+            )
+          )
+        }
+
+        return this.checkoutAfterRemoval(repository, options)
+      }
+    }
+
     const isDeletingCurrentWorktree = repository.path === worktreePath
     let originalWorktree: WorktreeEntry | null = null
 
@@ -5963,7 +6205,7 @@ export class AppStore extends TypedBaseStore<IAppState> {
     }
 
     try {
-      await removeWorktree(repository.path, worktreePath, force)
+      await removeWorktree(repository.path, worktreePath, options.force)
     } catch (e) {
       this._closePopup(PopupType.DeleteWorktree)
       this._closePopup(PopupType.DeleteWorktreeFailed)
@@ -5973,12 +6215,27 @@ export class AppStore extends TypedBaseStore<IAppState> {
         worktreePath,
         error: e,
         originalWorktree,
+        options,
       })
       return
     }
 
     await this._refreshWorktrees(repository)
     this.statsStore.increment('worktreeDeletedCount')
+    this.checkoutAfterRemoval(repository, options)
+  }
+
+  private checkoutAfterRemoval(
+    repository: Repository,
+    { checkout }: IDeleteWorktreeOptions
+  ) {
+    if (checkout !== undefined) {
+      this._checkoutBranch(
+        repository,
+        checkout.branch,
+        checkout.strategy
+      ).catch(e => this.emitError(e))
+    }
   }
 
   /** This shouldn't be called directly. See 'Dispatcher'. */
@@ -6190,28 +6447,30 @@ export class AppStore extends TypedBaseStore<IAppState> {
     }
 
     return this.withIsGeneratingCommitMessage(repository, async signal => {
-      // If user is amending a commit, we want to use the commit
-      // to amend as the base for the commit message generation.
-      const commitToAmend =
-        this.repositoryStateCache.get(repository)?.commitToAmend?.sha ??
-        undefined
-      const diff = await getFilesDiffText(
-        repository,
-        filesSelected,
-        commitToAmend ? `${commitToAmend}^` : undefined
-      )
-      if (!diff) {
-        return false
-      }
-
       try {
+        // If user is amending a commit, we want to use the commit
+        // to amend as the base for the commit message generation.
+        const commitToAmend =
+          this.repositoryStateCache.get(repository)?.commitToAmend?.sha ??
+          undefined
+        const diff = await getFilesDiffText(
+          repository,
+          filesSelected,
+          commitToAmend ? `${commitToAmend}^` : undefined
+        )
+        if (!diff) {
+          return false
+        }
+
         const response = enableCopilotSdkCommitMessageGeneration(account)
           ? await this.copilotStore.generateCommitMessage(
               account,
               diff,
               repository.path,
               await this.resolveCopilotModelRequest(
-                this.selectedCopilotModels['commit-message-generation'] ?? null
+                this.getSelectedCopilotModels(account)[
+                  'commit-message-generation'
+                ] ?? null
               ),
               this.repositoryStateCache
                 .get(repository)
@@ -6323,6 +6582,7 @@ export class AppStore extends TypedBaseStore<IAppState> {
   ): Promise<{
     readonly resolutions: ReadonlyArray<IFileResolution>
     readonly summary: ICopilotResolutionSummary
+    readonly skippedFiles: ReadonlyArray<ICopilotSkippedFile>
   } | null> {
     if (!enableCopilotConflictResolution()) {
       return null
@@ -6332,12 +6592,12 @@ export class AppStore extends TypedBaseStore<IAppState> {
       this.accounts,
       repository
     )
-
     if (!account) {
       return null
     }
 
     const totalTimer = startTimer('resolve conflicts with Copilot', repository)
+    let failureStage: CopilotConflictResolutionFailureStage = 'gather-context'
 
     try {
       const state = this.repositoryStateCache.get(repository)
@@ -6346,6 +6606,9 @@ export class AppStore extends TypedBaseStore<IAppState> {
       if (conflictState === null) {
         log.warn(
           'AppStore: resolveConflictsWithCopilot called with no active conflict state'
+        )
+        this.statsStore.increment(
+          'copilotConflictResolutionNoConflictStateCount'
         )
         return null
       }
@@ -6367,6 +6630,9 @@ export class AppStore extends TypedBaseStore<IAppState> {
         log.warn(
           'AppStore: resolveConflictsWithCopilot called with no conflicted files'
         )
+        this.statsStore.increment(
+          'copilotConflictResolutionNoConflictedFilesCount'
+        )
         return null
       }
 
@@ -6385,8 +6651,9 @@ export class AppStore extends TypedBaseStore<IAppState> {
         'copilotStore.resolveConflicts',
         repository
       )
+      failureStage = 'resolve-model'
       const modelRequest = await this.resolveCopilotModelRequest(
-        this.selectedCopilotModels['conflict-resolution'] ?? null
+        this.getSelectedCopilotModels(account)['conflict-resolution'] ?? null
       )
       try {
         const result = await this.copilotStore.resolveConflicts(
@@ -6397,6 +6664,7 @@ export class AppStore extends TypedBaseStore<IAppState> {
           onProgress,
           signal
         )
+        failureStage = 'process-result'
 
         // The model can only cite data we placed in the prompt, so resolving
         // its references is a simple lookup against the gathered context —
@@ -6407,6 +6675,24 @@ export class AppStore extends TypedBaseStore<IAppState> {
         const references =
           cited.length > 0 ? cited : fallbackReferencedContext(context)
 
+        // Files Copilot declined to resolve (too large, unreadable, no
+        // parseable markers, etc.) so the result dialog can surface them for
+        // manual resolution.
+        const skippedFiles = context.files.flatMap(f =>
+          f.skippedReason !== undefined
+            ? [{ path: f.path, reason: f.skippedReason }]
+            : []
+        )
+
+        if (
+          result.resolutions.length === 0 &&
+          skippedFiles.length === context.files.length
+        ) {
+          this.statsStore.increment(
+            'copilotConflictResolutionAllFilesSkippedCount'
+          )
+        }
+
         return {
           resolutions: result.resolutions,
           summary: {
@@ -6415,6 +6701,7 @@ export class AppStore extends TypedBaseStore<IAppState> {
             theirLabel: labels.theirLabel,
             references,
           },
+          skippedFiles,
         }
       } finally {
         resolveTimer.done()
@@ -6425,8 +6712,12 @@ export class AppStore extends TypedBaseStore<IAppState> {
         log.info('AppStore: Copilot conflict resolution aborted by user')
         return null
       }
+      // Propagate real failures so the caller can surface the underlying error
+      // instead of a generic "no results" message.
       log.warn('AppStore: Copilot conflict resolution failed', e)
-      return null
+      throw e instanceof CopilotConflictResolutionError
+        ? e
+        : new CopilotConflictResolutionError(e, failureStage)
     } finally {
       totalTimer.done()
     }
@@ -6454,15 +6745,24 @@ export class AppStore extends TypedBaseStore<IAppState> {
       readonly ourRef: string | undefined
       readonly theirRef: string | undefined
     },
-    conflictedFiles: ReadonlyArray<{ readonly path: string }>,
+    conflictedFiles: ReadonlyArray<WorkingDirectoryFileChange>,
     state: IRepositoryState
   ): Promise<IConflictResolutionContext> {
+    // Enrich file entries with delete-vs-modify metadata so
+    // buildConflictContext includes them instead of skipping.
+    const filesWithDeleteInfo = conflictedFiles.map(f => {
+      const deletedSide = getDeletedSideFromStatus(f)
+      return deletedSide !== undefined
+        ? { path: f.path, deletedSide }
+        : { path: f.path }
+    })
+
     const contextTimer = startTimer('build conflict context', repository)
     const fileContext = await buildConflictContext(
       labels.ourLabel,
       labels.theirLabel,
       repository.path,
-      conflictedFiles
+      filesWithDeleteInfo
     )
     contextTimer.done()
 
@@ -6717,13 +7017,23 @@ export class AppStore extends TypedBaseStore<IAppState> {
     }
 
     const { conflictState } = step
+    const account = getAccountForCopilotConflictResolution(
+      this.accounts,
+      repository
+    )
+    if (!account) {
+      return
+    }
 
     // Controller used to actually cancel the in-flight SDK turn when the user
     // clicks "Stop" (see _abortCopilotConflictResolution).
     const abortController = new AbortController()
+    const copilotModels =
+      this.copilotModelsByAccount.get(getCopilotAccountCacheKey(account)) ??
+      null
     const copilotResolutionModel = getConflictResolutionModelDisplay(
-      this.selectedCopilotModels['conflict-resolution'] ?? null,
-      this.copilotModels,
+      this.getSelectedCopilotModels(account)['conflict-resolution'] ?? null,
+      copilotModels,
       this.byokProviders
     )
     this.repositoryStateCache.updateMultiCommitOperationState(
@@ -6824,7 +7134,20 @@ export class AppStore extends TypedBaseStore<IAppState> {
       }
 
       if (result === null) {
-        throw new Error('Copilot conflict resolution returned no results')
+        this.repositoryStateCache.updateMultiCommitOperationState(
+          repository,
+          () => ({
+            step: {
+              kind: MultiCommitOperationStepKind.ShowConflicts,
+              conflictState,
+            },
+            useCopilotConflictResolution: false,
+            copilotResolutionProgress: null,
+            copilotResolutionAbortController: null,
+          })
+        )
+        this.emitUpdate()
+        return
       }
 
       if (isConfirmAbortFromLoading) {
@@ -6841,6 +7164,7 @@ export class AppStore extends TypedBaseStore<IAppState> {
             },
             copilotResolutions: result.resolutions,
             copilotResolutionSummary: result.summary,
+            copilotSkippedFiles: result.skippedFiles,
             copilotResolutionProgress: null,
             copilotResolutionAbortController: null,
           })
@@ -6862,6 +7186,7 @@ export class AppStore extends TypedBaseStore<IAppState> {
           },
           copilotResolutions: result.resolutions,
           copilotResolutionSummary: result.summary,
+          copilotSkippedFiles: result.skippedFiles,
           copilotResolutionProgress: null,
           copilotResolutionAbortController: null,
         })
@@ -6893,10 +7218,18 @@ export class AppStore extends TypedBaseStore<IAppState> {
 
       this.statsStore.increment('copilotConflictResolutionErrorCount')
 
+      const failure =
+        e instanceof CopilotConflictResolutionError
+          ? e
+          : new CopilotConflictResolutionError(e, 'unknown')
+      sendNonFatalException('copilotConflictResolution', failure)
+
       // Surface the error to the user so they understand why they were
       // routed back to manual conflict resolution. Mirrors the pattern
       // used by `_generateCommitMessage`.
-      this.emitError(new ErrorWithMetadata(e, { repository }))
+      this.emitError(
+        new ErrorWithMetadata(failure.underlyingError, { repository })
+      )
 
       // Transition back to manual conflict resolution
       this.repositoryStateCache.updateMultiCommitOperationState(
@@ -6909,6 +7242,7 @@ export class AppStore extends TypedBaseStore<IAppState> {
           useCopilotConflictResolution: false,
           copilotResolutions: null,
           copilotResolutionSummary: null,
+          copilotSkippedFiles: null,
           copilotResolutionProgress: null,
           copilotResolutionAbortController: null,
         })
@@ -6976,11 +7310,60 @@ export class AppStore extends TypedBaseStore<IAppState> {
         continue
       }
 
+      // Delete-vs-modify conflicts are resolved by setting a manual
+      // resolution (ours/theirs) rather than writing file content.
+      // The existing stageManualConflictResolution flow handles the
+      // actual git checkout --ours/--theirs and staging at commit time.
+      if (resolution.deleteConflictAction !== undefined) {
+        const file = state.changesState.workingDirectory.files.find(
+          f => f.path === resolution.path
+        )
+        if (file === undefined) {
+          continue
+        }
+        const deletedSide = getDeletedSideFromStatus(file)
+        if (deletedSide === undefined) {
+          continue
+        }
+        // "keep" → choose the non-deleted side, "delete" → choose the deleted side
+        const manualChoice =
+          resolution.deleteConflictAction === 'keep'
+            ? deletedSide === 'ours'
+              ? ManualConflictResolution.theirs
+              : ManualConflictResolution.ours
+            : deletedSide === 'ours'
+            ? ManualConflictResolution.ours
+            : ManualConflictResolution.theirs
+        this._updateManualConflictResolution(
+          repository,
+          resolution.path,
+          manualChoice
+        )
+        continue
+      }
+
       const absolutePath = await resolveWithin(repository.path, resolution.path)
       if (absolutePath === null) {
         log.warn(
           `Copilot resolution skipped: path outside repository: ${resolution.path}`
         )
+        continue
+      }
+
+      // If the user resolved this file externally (e.g. in their editor) while
+      // the result dialog was open, git status will report it with no remaining
+      // conflict markers. Overwriting it with Copilot's stored content would
+      // silently clobber their work, so skip it and let their resolution stand.
+      // This mirrors how the manual conflicts dialog determines a file is
+      // resolved (`hasUnresolvedConflicts`).
+      const onDiskFile = state.changesState.workingDirectory.files.find(
+        f => f.path === resolution.path
+      )
+      if (
+        onDiskFile !== undefined &&
+        isConflictedFileStatus(onDiskFile.status) &&
+        !hasUnresolvedConflicts(onDiskFile.status)
+      ) {
         continue
       }
 
@@ -7358,6 +7741,49 @@ export class AppStore extends TypedBaseStore<IAppState> {
     }
   }
 
+  /** This shouldn't be called directly. See `Dispatcher`. */
+  public async _openInCopilotApp(repositoryPath: string): Promise<void> {
+    if (!enableCopilotAppHandoff()) {
+      log.debug('Ignoring unavailable Copilot app handoff')
+      return
+    }
+
+    try {
+      const appPath =
+        this.copilotAppPath !== null
+          ? this.copilotAppPath
+          : (await findCopilotApp()) ?? undefined
+      if (appPath === undefined) {
+        throw new CopilotAppError(
+          'not-found',
+          'GitHub Copilot could not be found.'
+        )
+      }
+
+      await openInCopilotApp(appPath, repositoryPath)
+    } catch (error) {
+      log.error('Could not hand off to GitHub Copilot', error)
+      if (error instanceof CopilotAppError && error.kind === 'not-found') {
+        this._showPopup({
+          type: PopupType.CopilotAppNotFound,
+        })
+      } else {
+        throw error
+      }
+    }
+  }
+
+  /** This shouldn't be called directly. See `Dispatcher`. */
+  public async _setCopilotAppPath(path: string | null): Promise<void> {
+    if (path === null) {
+      localStorage.removeItem(copilotAppPathKey)
+    } else {
+      localStorage.setItem(copilotAppPathKey, path)
+    }
+    this.copilotAppPath = path
+    this.emitUpdate()
+  }
+
   /** Open a path using a selected editor without changing preferences. */
   public async _openInSelectedExternalEditor(
     fullPath: string,
@@ -7651,6 +8077,11 @@ export class AppStore extends TypedBaseStore<IAppState> {
     return this.statsStore.reportStats(this.accounts, this.repositories)
   }
 
+  /** This shouldn't be called directly. See 'Dispatcher'. */
+  public _sendStats() {
+    return this.statsStore.sendStats(this.accounts, this.repositories)
+  }
+
   public _recordLaunchStats(stats: ILaunchStats): Promise<void> {
     return this.statsStore.recordLaunchStats(stats)
   }
@@ -7690,8 +8121,12 @@ export class AppStore extends TypedBaseStore<IAppState> {
     return this.signInStore.beginEnterpriseSignIn(resultCallback)
   }
 
-  public _setSignInEndpoint(url: string): Promise<void> {
-    return this.signInStore.setEndpoint(url)
+  /** This shouldn't be called directly. See 'Dispatcher'. */
+  public _setSignInEndpoint(
+    url: string,
+    isEndpointFromGit = false
+  ): Promise<void> {
+    return this.signInStore.setEndpoint(url, isEndpointFromGit)
   }
 
   public _requestBrowserAuthentication() {
@@ -7753,22 +8188,20 @@ export class AppStore extends TypedBaseStore<IAppState> {
     log.info(
       `[AppStore] removing account ${account.login} (${account.name}) from store`
     )
-    await this.accountsStore.removeAccount(account)
-    await deleteToken(account)
+    const current = await this.accountsStore.removeAccount(account)
+    if (current?.token) {
+      await deleteToken(current)
+    }
   }
 
-  private async _addAccount(account: Account): Promise<void> {
-    log.info(
-      `[AppStore] adding account ${account.login} (${account.name}) to store`
-    )
-    const storedAccount = await this.accountsStore.addAccount(account)
-
+  private onDidAuthenticate(account: Account): void {
+    log.info(`[AppStore] signed in as ${account.login} (${account.name})`)
     // If we're in the welcome flow and a user signs in we want to trigger
     // a refresh of the repositories available for cloning straight away
     // in order to have the list of repositories ready for them when they
     // get to the blankslate.
-    if (this.showWelcomeFlow && storedAccount !== null) {
-      this.apiRepositoriesStore.loadRepositories(storedAccount)
+    if (this.showWelcomeFlow) {
+      this.apiRepositoriesStore.loadRepositories(account)
     }
   }
 
@@ -7912,15 +8345,22 @@ export class AppStore extends TypedBaseStore<IAppState> {
     const rt = await getRepositoryType(path)
 
     if (rt.kind === 'regular') {
+      // The repository has moved, so any main worktree we recorded before now
+      // points at where it used to be. Resolve it again from the new location.
       await this.repositoriesStore.updateRepositoryPath(
         repository,
         rt.topLevelWorkingDirectory,
-        rt.gitDir
+        rt.gitDir,
+        await this.findMainWorktreePath(rt.topLevelWorkingDirectory)
       )
     } else if (rt.kind === 'unsafe') {
+      // Git refuses to run in a repository it considers unsafe, so there's no
+      // resolving the main worktree here. Drop the recorded path rather than
+      // keep one we know is stale.
       await this.repositoriesStore.updateRepositoryPath(
         repository,
         path,
+        undefined,
         undefined,
         true
       )
@@ -8068,7 +8508,7 @@ export class AppStore extends TypedBaseStore<IAppState> {
   private async isUsingLFS(repository: Repository): Promise<boolean> {
     try {
       return await isUsingLFS(repository)
-    } catch (error) {
+    } catch {
       return false
     }
   }
@@ -8668,6 +9108,19 @@ export class AppStore extends TypedBaseStore<IAppState> {
     }
 
     await this.currentBranchPruner.testPrune()
+  }
+
+  /** This shouldn't be called directly. See 'Dispatcher'. */
+  public _getAccountTokenExpirationForTesting(account: Account) {
+    return this.accountsStore.getTokenExpirationForTesting(account)
+  }
+
+  /** This shouldn't be called directly. See 'Dispatcher'. */
+  public _setAccountTokenExpirationForTesting(
+    account: Account,
+    expiresAt: number | undefined
+  ) {
+    return this.accountsStore.setTokenExpirationForTesting(account, expiresAt)
   }
 
   public async _showCreateForkDialog(
@@ -9451,6 +9904,7 @@ export class AppStore extends TypedBaseStore<IAppState> {
       useCopilotConflictResolution: false,
       copilotResolutions: null,
       copilotResolutionSummary: null,
+      copilotSkippedFiles: null,
       copilotResolutionProgress: null,
       copilotResolutionAbortController: null,
       copilotResolutionModel: null,
@@ -9933,27 +10387,46 @@ export class AppStore extends TypedBaseStore<IAppState> {
   }
 
   /** This shouldn't be called directly. See 'Dispatcher'. */
-  public _setSelectedCopilotModel(
-    feature: CopilotFeature,
-    model: string | null
-  ) {
-    const current = this.selectedCopilotModels[feature] ?? null
-    if (model !== current) {
-      if (model === null) {
-        const updated = { ...this.selectedCopilotModels }
-        delete updated[feature]
-        this.selectedCopilotModels = updated
-      } else {
-        this.selectedCopilotModels = {
-          ...this.selectedCopilotModels,
-          [feature]: model,
-        }
-      }
-      this.saveCopilotModelSelections()
+  public _setAlwaysShowWorktreeList(alwaysShowWorktreeList: boolean) {
+    if (alwaysShowWorktreeList !== this.alwaysShowWorktreeList) {
+      this.alwaysShowWorktreeList = alwaysShowWorktreeList
+      setBoolean(alwaysShowWorktreeListKey, alwaysShowWorktreeList)
+      this.updateResizableConstraints()
+      this.emitUpdate()
     }
   }
 
-  private loadCopilotModelSelections(): CopilotModelSelections {
+  /** This shouldn't be called directly. See 'Dispatcher'. */
+  public _setSelectedCopilotModel(
+    account: Account,
+    feature: CopilotFeature,
+    model: string | null
+  ) {
+    const accountKey = getCopilotAccountCacheKey(account)
+    const currentSelections =
+      this.selectedCopilotModelsByAccount.get(accountKey) ?? {}
+    const current = currentSelections[feature] ?? null
+    if (model !== current) {
+      const updatedSelections = { ...currentSelections }
+      if (model === null) {
+        delete updatedSelections[feature]
+      } else {
+        updatedSelections[feature] = model
+      }
+
+      const updatedByAccount = new Map(this.selectedCopilotModelsByAccount)
+      if (Object.keys(updatedSelections).length === 0) {
+        updatedByAccount.delete(accountKey)
+      } else {
+        updatedByAccount.set(accountKey, updatedSelections)
+      }
+      this.selectedCopilotModelsByAccount = updatedByAccount
+      this.saveCopilotModelSelectionsByAccount()
+      this.emitUpdate()
+    }
+  }
+
+  private loadLegacyCopilotModelSelections(): CopilotModelSelections {
     const raw = localStorage.getItem(selectedCopilotModelsKey)
     if (raw !== null) {
       try {
@@ -9966,47 +10439,84 @@ export class AppStore extends TypedBaseStore<IAppState> {
       }
     }
 
-    // Migrate from the old single-model key
-    const legacy = localStorage.getItem('selected-copilot-model')
-    if (legacy !== null) {
-      localStorage.removeItem('selected-copilot-model')
-      const selections: CopilotModelSelections = {
-        'commit-message-generation': legacy,
-      }
-      localStorage.setItem(selectedCopilotModelsKey, JSON.stringify(selections))
-      return selections
-    }
-
     return {}
   }
 
-  private saveCopilotModelSelections() {
-    const keys = Object.keys(this.selectedCopilotModels)
-    if (keys.length === 0) {
-      localStorage.removeItem(selectedCopilotModelsKey)
-    } else {
-      localStorage.setItem(
-        selectedCopilotModelsKey,
-        JSON.stringify(this.selectedCopilotModels)
-      )
+  private loadCopilotModelSelectionsByAccount(): CopilotModelSelectionsByAccount {
+    const raw = localStorage.getItem(selectedCopilotModelsByAccountKey)
+    if (raw === null) {
+      return new Map()
     }
+
+    try {
+      const parsed: unknown = JSON.parse(raw)
+      if (typeof parsed === 'object' && parsed !== null) {
+        return new Map(Object.entries(parsed))
+      }
+    } catch {
+      // Ignore invalid persisted selections.
+    }
+
+    return new Map()
+  }
+
+  private saveCopilotModelSelectionsByAccount(): void {
+    if (this.selectedCopilotModelsByAccount.size === 0) {
+      localStorage.removeItem(selectedCopilotModelsByAccountKey)
+      return
+    }
+
+    localStorage.setItem(
+      selectedCopilotModelsByAccountKey,
+      JSON.stringify(Object.fromEntries(this.selectedCopilotModelsByAccount))
+    )
+  }
+
+  // TODO: to be removed after the migration period. Now Copilot models are stored
+  // per account, not globally.
+  private migrateCopilotModelSelections(): void {
+    const legacySelections = this.loadLegacyCopilotModelSelections()
+    if (Object.keys(legacySelections).length > 0) {
+      this.selectedCopilotModelsByAccount =
+        migrateCopilotModelSelectionsToAccounts(
+          legacySelections,
+          this.selectedCopilotModelsByAccount,
+          this.accounts
+        )
+      this.saveCopilotModelSelectionsByAccount()
+    }
+
+    localStorage.removeItem(selectedCopilotModelsKey)
+  }
+
+  private getSelectedCopilotModels(account: Account): CopilotModelSelections {
+    return (
+      this.selectedCopilotModelsByAccount.get(
+        getCopilotAccountCacheKey(account)
+      ) ?? {}
+    )
   }
 
   /** This shouldn't be called directly. See 'Dispatcher'. */
-  public _setSelectedCopilotModels(models: CopilotModelSelections) {
-    this.selectedCopilotModels = { ...models }
+  public _setSelectedCopilotModelsByAccount(
+    modelsByAccount: CopilotModelSelectionsByAccount
+  ) {
+    this.selectedCopilotModelsByAccount = new Map(
+      [...modelsByAccount].map(([key, models]) => [key, { ...models }])
+    )
     // The Preferences dialog keeps its own copy of the selections in
     // component state. If the user deletes/edits a BYOK provider through
     // the popup stack while the dialog is open, that local copy can still
     // reference a model that no longer exists; scrub on save so we never
     // resurrect a stale selection.
     this.scrubMissingCopilotModelSelections()
-    this.saveCopilotModelSelections()
+    this.saveCopilotModelSelectionsByAccount()
+    this.emitUpdate()
   }
 
   /**
-   * Resolves a stored Copilot model selection (the composite key persisted in
-   * `selectedCopilotModels`) into a {@link CopilotModelRequest} suitable for
+   * Resolves a stored account Copilot model selection into a
+   * {@link CopilotModelRequest} suitable for
    * {@link CopilotStore.generateCommitMessage}. BYOK provider secrets are
    * read from the OS keychain at call time.
    */
@@ -10164,10 +10674,38 @@ export class AppStore extends TypedBaseStore<IAppState> {
    * so a transient empty list doesn't downgrade valid selections.
    */
   private scrubMissingCopilotModelSelections(): void {
+    const selectionsByAccount = new Map<string, CopilotModelSelections>()
+
+    for (const [accountKey, selections] of this
+      .selectedCopilotModelsByAccount) {
+      const updated = this.scrubCopilotModelSelections(
+        selections,
+        this.copilotModelsByAccount.get(accountKey)
+      )
+      if (Object.keys(updated).length > 0) {
+        selectionsByAccount.set(accountKey, updated)
+      }
+    }
+
+    if (
+      selectionsByAccount.size !== this.selectedCopilotModelsByAccount.size ||
+      [...selectionsByAccount].some(
+        ([key, selections]) =>
+          selections !== this.selectedCopilotModelsByAccount.get(key)
+      )
+    ) {
+      this.selectedCopilotModelsByAccount = selectionsByAccount
+      this.saveCopilotModelSelectionsByAccount()
+    }
+  }
+
+  private scrubCopilotModelSelections(
+    selections: CopilotModelSelections,
+    copilotModels?: ReadonlyArray<Model> | null
+  ): CopilotModelSelections {
     const updated: CopilotModelSelections = {}
-    let changed = false
-    const copilotModels = this.copilotModels
-    for (const [feature, raw] of Object.entries(this.selectedCopilotModels)) {
+
+    for (const [feature, raw] of Object.entries(selections)) {
       if (raw === undefined) {
         continue
       }
@@ -10178,52 +10716,78 @@ export class AppStore extends TypedBaseStore<IAppState> {
           provider === undefined ||
           !provider.models.some(m => m.id === key.modelId)
         ) {
-          changed = true
           continue
         }
       } else if (
         key.kind === 'copilot' &&
         key.modelId !== '' &&
+        copilotModels !== undefined &&
         copilotModels !== null &&
         !copilotModels.some(m => m.id === key.modelId)
       ) {
-        changed = true
         continue
       }
       updated[feature as CopilotFeature] = raw
     }
 
-    if (changed) {
-      this.selectedCopilotModels = updated
-      this.saveCopilotModelSelections()
-    }
+    return Object.keys(updated).length === Object.keys(selections).length
+      ? selections
+      : updated
   }
 
   /** This shouldn't be called directly. See 'Dispatcher'. */
   public async _fetchCopilotModels(): Promise<void> {
-    return this.fetchCopilotModelsForCurrentAccount()
+    return this.fetchCopilotModelsForCurrentAccounts()
   }
 
-  private async fetchCopilotModelsForCurrentAccount(): Promise<void> {
-    const account = this.getCopilotModelsAccount()
-    if (account === undefined) {
-      this.copilotModels = null
+  /** This shouldn't be called directly. See 'Dispatcher'. */
+  public async _fetchCopilotQuotaSnapshots(): Promise<void> {
+    return this.fetchCopilotQuotaSnapshotsForCurrentAccounts()
+  }
+
+  private async fetchCopilotModelsForCurrentAccounts(): Promise<void> {
+    const accounts = this.getCopilotSettingsAccounts()
+    if (accounts.length === 0) {
+      this.copilotModelsByAccount = new Map()
       this.emitUpdate()
       return
     }
 
-    const models = await this.copilotStore.listModels(account)
-    // Only overwrite the cached model list when we actually got a list back.
-    // listModels() returns null when the result is unknown (the selected
-    // account cannot use the SDK or an SDK failure has no prior cache);
-    // treating that as an empty list would scrub the user's Copilot model
-    // selections.
-    if (models !== null) {
-      this.copilotModels = [...models]
-      this.scrubMissingCopilotModelSelections()
-    } else {
-      this.syncCopilotModelsFromCache()
+    const copilotModelsByAccount = new Map(this.copilotModelsByAccount)
+
+    for (const account of accounts) {
+      const models = await this.copilotStore.listModels(account)
+      const key = getCopilotAccountCacheKey(account)
+      copilotModelsByAccount.set(key, models === null ? null : [...models])
     }
+
+    this.copilotModelsByAccount = copilotModelsByAccount
+    if ([...copilotModelsByAccount.values()].some(models => models !== null)) {
+      this.scrubMissingCopilotModelSelections()
+    }
+    this.emitUpdate()
+  }
+
+  private async fetchCopilotQuotaSnapshotsForCurrentAccounts(): Promise<void> {
+    const accounts = this.getCopilotSettingsAccounts()
+    if (accounts.length === 0) {
+      this.copilotQuotaSnapshotsByAccount = new Map()
+      this.emitUpdate()
+      return
+    }
+
+    const copilotQuotaSnapshotsByAccount = new Map(
+      this.copilotQuotaSnapshotsByAccount
+    )
+
+    for (const account of accounts) {
+      copilotQuotaSnapshotsByAccount.set(
+        getCopilotAccountCacheKey(account),
+        await this.copilotStore.getQuotaSnapshots(account)
+      )
+    }
+
+    this.copilotQuotaSnapshotsByAccount = copilotQuotaSnapshotsByAccount
     this.emitUpdate()
   }
 
@@ -10399,4 +10963,31 @@ function constrain(
     min,
     max: constrainedMax,
   }
+}
+
+/**
+ * For a conflicted file, determine which side deleted the file (if any).
+ * Returns `'ours'` or `'theirs'` for delete-vs-modify conflicts, or
+ * `undefined` for other conflict types.
+ */
+function getDeletedSideFromStatus(
+  file: WorkingDirectoryFileChange
+): 'ours' | 'theirs' | undefined {
+  if (!isConflictedFileStatus(file.status)) {
+    return undefined
+  }
+  const { entry } = file.status
+  if (
+    entry.us === GitStatusEntry.Deleted &&
+    entry.them !== GitStatusEntry.Deleted
+  ) {
+    return 'ours'
+  }
+  if (
+    entry.them === GitStatusEntry.Deleted &&
+    entry.us !== GitStatusEntry.Deleted
+  ) {
+    return 'theirs'
+  }
+  return undefined
 }

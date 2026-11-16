@@ -2,7 +2,6 @@
 /// <reference path="./globals.d.ts" />
 
 import * as cp from 'child_process'
-import packager, { OfficialArch, OsxNotarizeOptions } from 'electron-packager'
 import frontMatter from 'front-matter'
 import * as os from 'os'
 import * as path from 'path'
@@ -22,6 +21,19 @@ export interface ILicense {
   readonly featured: boolean
   readonly body: string
   readonly hidden: boolean
+}
+
+type DesktopPackageArch = 'arm64' | 'x64'
+type DesktopPackagePlatform = 'darwin' | 'linux' | 'win32'
+
+interface IDesktopPackagerModule {
+  readonly packager: (options: object) => Promise<ReadonlyArray<string>>
+}
+
+interface IOSXNotarizeOptions {
+  readonly appleApiKey: string
+  readonly appleApiKeyId: string
+  readonly appleApiIssuer: string
 }
 
 import {
@@ -55,6 +67,7 @@ import { updateLicenseDump } from './licenses/update-license-dump'
 import { verifyInjectedSassVariables } from './validate-sass/validate-all'
 import { join } from 'path'
 import assert from 'assert'
+import { copyCopilotDependency } from './copilot'
 
 const isPublishableBuild = isPublishable()
 const isDevelopmentBuild = getChannel() === 'development'
@@ -130,10 +143,15 @@ verifyInjectedSassVariables(outRoot)
     console.log(`Built to ${appPaths}`)
   })
 
-function packageApp() {
+async function packageApp() {
+  const packagerModuleName = '@electron/packager'
+  const { packager }: IDesktopPackagerModule = await import(packagerModuleName)
+
   // not sure if this is needed anywhere, so I'm just going to inline it here
   // for now and see what the future brings...
-  const toPackagePlatform = (platform: NodeJS.Platform) => {
+  const toPackagePlatform = (
+    platform: NodeJS.Platform
+  ): DesktopPackagePlatform => {
     if (platform === 'win32' || platform === 'darwin' || platform === 'linux') {
       return platform
     }
@@ -142,7 +160,9 @@ function packageApp() {
     )
   }
 
-  const toPackageArch = (targetArch: string | undefined): OfficialArch => {
+  const toPackageArch = (
+    targetArch: string | undefined
+  ): DesktopPackageArch => {
     if (targetArch === undefined) {
       targetArch = os.arch()
     }
@@ -167,7 +187,7 @@ function packageApp() {
   ) {
     // we can't publish a mac build without these
     throw new Error(
-      'Unable to retreive appleId and/or appleIdPassword to notarize macOS build'
+      'Unable to retrieve appleApiKey, appleApiKeyId, and/or appleApiIssuer to notarize macOS build'
     )
   }
 
@@ -190,16 +210,21 @@ function packageApp() {
     arch: toPackageArch(process.env.TARGET_ARCH),
     asar: false, // TODO: Probably wanna enable this down the road.
     out: getDistRoot(),
-    icon: join(iconPath, 'icon-logo'),
+    // Packager probes for a sibling .icon file and requires macOS 26 to compile
+    // it. Use a distinct basename so older build hosts use the prebuilt ICNS.
+    icon: join(
+      iconPath,
+      process.platform === 'darwin' ? 'icon-logo-legacy.icns' : 'icon-logo'
+    ),
     extraResource,
     dir: outRoot,
     overwrite: true,
     tmpdir: false,
-    derefSymlinks: false,
+    derefSymlinks: true,
     prune: false, // We'll prune them ourselves below.
     ignore: [
       new RegExp('/node_modules/electron($|/)'),
-      new RegExp('/node_modules/electron-packager($|/)'),
+      new RegExp('/node_modules/@electron/packager($|/)'),
       new RegExp('/\\.git($|/)'),
       new RegExp('/node_modules/\\.bin($|/)'),
     ],
@@ -356,7 +381,12 @@ function copyDependencies() {
   )
 
   console.log('  Copying copilot…')
-  copyCopilotDependency()
+  copyCopilotDependency(
+    path.join(projectRoot, 'app', 'node_modules'),
+    path.join(outRoot, 'copilot'),
+    process.platform,
+    getDistArchitecture()
+  )
 
   // Dev builds for macOS require a SSH wrapper to use SSH_ASKPASS
   if (process.platform === 'darwin' && isDevelopmentBuild) {
@@ -383,7 +413,7 @@ function copyDependencies() {
   })
 
   console.log('  Copying desktop credential helper…')
-  const mingw = getDistArchitecture() === 'x64' ? 'mingw64' : 'clangarm64'
+  const mingw = getDistArchitecture() === 'x64' ? 'ucrt64' : 'clangarm64'
   const gitCoreDir =
     process.platform === 'win32'
       ? path.resolve(outRoot, 'git', mingw, 'libexec', 'git-core')
@@ -493,31 +523,14 @@ ${licenseText}`
   rmSync(chooseALicense, { recursive: true, force: true })
 }
 
-function getNotarizationOptions(): OsxNotarizeOptions | undefined {
+function getNotarizationOptions(): IOSXNotarizeOptions | undefined {
   const {
-    APPLE_ID: appleId,
-    APPLE_ID_PASSWORD: appleIdPassword,
-    APPLE_TEAM_ID: teamId,
+    APPLE_API_KEY_PATH: appleApiKey,
+    APPLE_API_KEY_ID: appleApiKeyId,
+    APPLE_API_ISSUER: appleApiIssuer,
   } = process.env
 
-  return appleId && appleIdPassword && teamId
-    ? { tool: 'notarytool', appleId, appleIdPassword, teamId }
+  return appleApiKey && appleApiKeyId && appleApiIssuer
+    ? { appleApiKey, appleApiKeyId, appleApiIssuer }
     : undefined
-}
-
-function copyCopilotDependency() {
-  const currentPlatform = process.platform
-  const currentArch = getDistArchitecture()
-
-  // The @github/copilot package now uses platform-specific optional
-  // dependencies (e.g. @github/copilot-darwin-arm64) that already contain only
-  // the binaries for the target platform, so we copy the appropriate one
-  // directly instead of the base @github/copilot package.
-  const copilotPkgDir = path.resolve(
-    projectRoot,
-    `app/node_modules/@github/copilot-${currentPlatform}-${currentArch}`
-  )
-
-  const copilotDestination = path.resolve(outRoot, 'copilot')
-  removeAndCopy(copilotPkgDir, copilotDestination)
 }
